@@ -37,3 +37,5 @@ Read the numbered documents in order; each builds only on the ones before it.
 ## License
 
 [MIT](LICENSE)
+
+没有 GitHub 仓库也能以本地模式启动（P0，仓库变可选）。
