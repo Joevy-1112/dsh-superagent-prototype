@@ -1,7 +1,10 @@
 /** Main-session assessor per-eval state and context loading. */
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { expect, it, vi } from 'vitest'
 import type { Agent } from '@deepseek-ai/dsh-agent'
-import { AssessmentSchema, EvalReadSchema, MasterAssessor, type AssessorHost } from '../src/app/assessment.ts'
+import { AssessmentSchema, EvalReadSchema, MasterAssessor, WorktreeNameSchema, worktreeSegment, type AssessorHost } from '../src/app/assessment.ts'
 import { mainAdmissionPolicy } from '../src/app/context.ts'
 import { Engine, MemoryRepositories, type Executor, type Policy, type Trigger } from '../src/core/index.ts'
 import type { Commands } from '../src/infra/commands.ts'
@@ -180,4 +183,35 @@ it('lets the main Session read on from the cursor its loaded window ends with, a
   s2.engine.receive(long); s2.engine.receive({ ...issue(3), threads: issue(1).threads }); s2.engine.evaluateDue()
   const other = await s2.assessor.context('issue-3', signal) as { batch: Record<string, unknown>[] }
   expect(other.batch).toEqual([expect.objectContaining({ trigger_id: 'long', chars: long.text.length, read: 'trigger/long' })])
+})
+
+
+// A ticket's name is written by the main Session in the request's own language, and becomes its directory name.
+it('takes a ticket name in the request\'s own language, Chinese and spaces included, and keeps it one safe directory name', () => {
+  expect(WorktreeNameSchema.parse('修复登录页面')).toBe('修复登录页面')
+  expect(WorktreeNameSchema.parse('修复 登录 页面')).toBe('修复 登录 页面')
+  expect(WorktreeNameSchema.parse('fix-plan-color')).toBe('fix-plan-color')
+  expect(WorktreeNameSchema.parse('Fix login page')).toBe('Fix login page')
+  // Spaces and runs of hyphens fold into one hyphen where the name becomes a directory.
+  expect(worktreeSegment('修复 登录 页面')).toBe('修复-登录-页面')
+  expect(worktreeSegment('fix  --  login')).toBe('fix-login')
+  // The segment is one path component, so the ticket directory can be created as it is.
+  const root = mkdtempSync(join(tmpdir(), 'ticket-name-'))
+  try {
+    for (const name of ['修复 登录 页面', 'Fix login page']) {
+      const directory = join(root, worktreeSegment(name))
+      mkdirSync(directory)
+      expect(existsSync(directory)).toBe(true)
+    }
+    expect(readdirSync(root).sort()).toEqual(['Fix-login-page', '修复-登录-页面'].sort())
+  } finally { rmSync(root, { recursive: true, force: true }) }
+  // Characters a filesystem rejects, and names that are not one path segment, are refused instead of renamed behind the assessor's back.
+  for (const name of ['fix/a', 'a\\b', 'a:b', 'a*b', 'a?b', 'a"b', 'a<b', 'a>b', 'a|b', 'a\u0000b', '..', '.hidden', '-lead', 'tail-', ' lead', 'trail ', '']) {
+    expect(WorktreeNameSchema.safeParse(name).success, JSON.stringify(name)).toBe(false)
+  }
+  // The 32-character limit counts the characters written, so Chinese names fit as well as English ones.
+  expect(WorktreeNameSchema.safeParse('名'.repeat(32)).success).toBe(true)
+  expect(WorktreeNameSchema.safeParse('名'.repeat(33)).success).toBe(false)
+  // The assessment schema, which the eval tool fills, accepts the same names for an accepted candidate.
+  expect(WorktreeNameSchema.safeParse('修复 登录 页面').success).toBe(true)
 })

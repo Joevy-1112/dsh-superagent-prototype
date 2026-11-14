@@ -15,8 +15,20 @@ import { textPage } from './context.ts'
 import { AcknowledgementSchema } from './tools/tool.ts'
 import type { Effects } from './effects.ts'
 
-/** Schema for a short lowercase kebab-case English ticket worktree name (1–4 words, at most 32 characters). */
-export const WorktreeNameSchema = z.string().max(32).regex(/^[a-z]+(?:-[a-z0-9]+){0,3}$/, 'Use 1–4 short English words in lowercase kebab-case, at most 32 characters').describe('Meaningful short English ticket name, e.g. fix-plan-color. Translate Chinese titles into English; no Chinese, pinyin or generic ticket names. 1–4 lowercase words in kebab-case, at most 32 characters.')
+/** Filesystem characters that cannot appear in a ticket's directory name, which is derived from its short name. */
+const UNSAFE_PATH = /[/\\:*?"<>|\u0000-\u001f]/
+/**
+ * Schema for a ticket's short name: a meaningful label in the request's own language (Chinese included), at most 32
+ * characters. It stays a plain validating schema, which tool schemas need for their JSON Schema, so spaces are folded into
+ * hyphens where the name becomes a directory (`worktreeSegment`); characters a filesystem rejects are refused rather than
+ * silently renamed, so the directory always matches the name the assessor wrote.
+ */
+export const WorktreeNameSchema = z.string().min(1).max(32)
+  .refine(name => !UNSAFE_PATH.test(name), 'Use a name without / \\ : * ? " < > | or control characters: the ticket name is also its directory name')
+  .refine(name => !/^[-.\s]|[-.\s]$/.test(name), 'A ticket name cannot start or end with a hyphen, a dot or a space')
+  .describe('Meaningful short ticket name in the source language, e.g. fix-plan-color or 修复登录页: at most 32 characters, no / \\ : * ? " < > |, and no leading or trailing hyphen, dot or space.')
+/** The single path segment a validated ticket name becomes: runs of spaces and hyphens fold into one hyphen. */
+export const worktreeSegment = (name: string): string => WorktreeNameSchema.parse(name).replace(/[\s-]+/g, '-')
 /** Schema for the main Session's proactive candidate assessment decision (`orchestrator_eval_decide`). */
 export const AssessmentSchema = z.object({
   decision: z.enum(['accept', 'ignore', 'unavailable']),
@@ -31,7 +43,7 @@ export const AssessmentSchema = z.object({
   acknowledgement: AcknowledgementSchema.nullish().describe('For acceptance: one sentence in the source language, posted as a reply to the trigger; omit only when a matched rule asks for silence.'),
   reason: z.string().min(1).max(500),
 }).strict().refine(value => value.decision !== 'accept' || !directionAllowed(value.direction) || !value.rule_assessments.some(rule => rule.matched)
-  || !!value.worktree_name, { message: 'Accepted work requires a short English worktree_name', path: ['worktree_name'] })
+  || !!value.worktree_name, { message: 'Accepted work requires a short worktree_name', path: ['worktree_name'] })
 
 /** Character limits in the initial thread window: for the trigger itself, its two nearest neighbours, other window messages, and stub previews. */
 const TRIGGER_CHARS = 4000, NEAR_CHARS = 1200, WINDOW_CHARS = 400, STUB_CHARS = 50
@@ -263,6 +275,10 @@ export class MasterAssessor implements Assessor {
         body = JSON.stringify({ images: references, next_read: next, ...result.body })
       }
       else {
+        // Only a GitHub repository has files to read; local mode reads the thread instead.
+        if (!this.host.deployment.repository) {
+          throw new Error('This installation has no GitHub repository, so it has no files: read the thread, root or parent instead')
+        }
         body = await readRepositoryPath(commands, read.path!, read.resource === 'directory' ? 'directory' : 'file')
       }
       snapshots.set(cacheKey, body)

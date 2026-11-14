@@ -881,8 +881,9 @@ describe('the Executor\'s parts', () => {
     expect(slots.used()).toBe(4)
   })
   it('words an assignment, and the limits an inferred mandate sets, from the ticket alone', () => {
-    const settings = SettingsSchema.parse({ policy: { rules: [{ id: 'copy', name: 'Copy fixes', enabled: true,
-      instruction: 'Fix typos only.' }] } })
+    const settings = SettingsSchema.parse({ sources: { github: { enabled: true, config: { repository: 'acme/widgets' } } },
+      policy: { rules: [{ id: 'copy', name: 'Copy fixes', enabled: true,
+        instruction: 'Fix typos only.' }] } })
     const ticket = { id: 'ticket-0123456789abcdef', origin: { triggerId: 'tr1', triggerIds: [] },
       mandate: { strength: 'inferred', policyVersion: 'v1', basis: { rules: ['copy'] }, actor: { source: 'github', id: 'alice' },
         scope: '' } } as unknown as Ticket
@@ -899,6 +900,9 @@ describe('the Executor\'s parts', () => {
     // The worker's system prompt holds the limits an inferred Mandate sets, so the assignment does not repeat them.
     expect(execution.assignment).not.toContain(mandateInstructions(ticket.mandate))
     expect(execution.assignment).toContain('- Copy fixes (copy): Fix typos only.')
+    // An installation without a GitHub repository states the deliverable it can meet, so the worker does not wait for a PR.
+    expect(ticketExecution(ticket, { kind: 'accept', title: 'Fix', scope: 'the typo', reason: 'r', name: 'fix-typo' } as never,
+      SettingsSchema.parse({ policy: settings.policy }), '/state').assignment).toContain('no GitHub repository')
     expect(mandateInstructions({ strength: 'explicit' })).toBe('')
   })
   it('renders each kind of Input as its worker reads it, inline, and no reopen Input', () => {

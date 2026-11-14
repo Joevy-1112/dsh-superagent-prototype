@@ -144,9 +144,9 @@ export class Runtime extends Service implements SourceHost {
           const followed = !this.quiet && (event.type === 'trigger.received' || event.type === 'ticket.resumed' || event.type === 'trigger.followup')
           const followup = followed ? followupNotice(store, sources, event.data.triggerId) : undefined
           if (followup) sessions.relay(followup.id, followup.text)
-          // Notify the ticket's conversations whenever it ends via a pull request.
+          // Notify the ticket's conversations whenever it ends via a pull request; local mode has none to report.
           const ended = event.type === 'ticket.ended' ? store.tickets.get(event.data.ticketId) : undefined
-          if (ended && setup.configured()) {
+          if (ended && setup.configured() && setup.deployment.repository) {
             const request = store.triggers.get(ended.origin.triggerId)?.text ?? ''
             for (const message of pullEndNotices(ended, request, setup.deployment.repository)) outbox.send(message)
           }
@@ -160,7 +160,7 @@ export class Runtime extends Service implements SourceHost {
         get deployment() { return setup.deployment }, configured: () => setup.configured(),
         get setupProblem() { return setup.problem }, get feishuProblem() { return setup.feishuProblem }, receive: trigger => passes.receive(trigger) }
       this.toolHost = { context: ctx, engine, store, prompts, sessions, settings: this.settings, assessor, resources,
-        get github() { return runtime.context({ kind: 'github', health: ['github'] }) },
+        get github() { return setup.configured() && setup.deployment.repository ? runtime.context({ kind: 'github', health: ['github'] }) : undefined },
         requestPass: () => { passes.request() }, sendReplies: () => outbox.sent(),
         quietly: run => { this.quiet++; try { return run() } finally { this.quiet-- } } }
       this.ready = this.initialize()
@@ -197,7 +197,25 @@ export class Runtime extends Service implements SourceHost {
   sendReplies(): Promise<void> { return this.outbox.sent() }
   private closing(): boolean { return this.closingFlag }
   /** Hold evaluation, dispatch, and outbound delivery while paused or awaiting setup; sources still record incoming triggers. */
-  private paused(): boolean { return !this.setup.configured() || this.store.settings().paused }
+  private paused(): boolean {
+    if (this.store.settings().paused) return true
+    // Not paused once setup resolved the Deployment its Sources work with. That is not the same as "GitHub answered":
+    // setup resolves local mode when the GitHub Source names no repository, verifying only the Sources that are enabled,
+    // so a Feishu-only installation configures and dispatches instead of waiting forever for a repository.
+    if (this.setup.configured()) return false
+    // Setup resolved no Deployment, so nothing dispatches (a worker needs its environment and accounts). Even then the held
+    // work is not "waiting for GitHub": a Source that finished its own setup and health check keeps the runtime unpaused, so
+    // the verdict follows the Sources rather than the GitHub part. Today a Source loop stops at `!ctx.configured()` first, so
+    // this stays a guard for a Source that reports ready before setup resolves; serving workers per Source would need a
+    // Deployment per Source, which this class does not have.
+    return !this.someSourceReady()
+  }
+  /** Whether an enabled Source kind reports one of its declared health entries as ready, its own check having passed. */
+  private someSourceReady(): boolean {
+    const health = this.health
+    return this.sources.instances().some(instance => instance.installed && instance.enabled
+      && (this.sources.kind(instance.kind)?.health ?? []).some(name => health[name]?.state === 'ready'))
+  }
   private async initialize(): Promise<void> {
     // Register management HTTP routes before setup completes so operators can fix setup problems in the UI.
     this.disposers.push(registerHttp(this.ctx, this.httpHost()))
