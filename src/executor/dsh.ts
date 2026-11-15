@@ -1,6 +1,6 @@
 /** DSH executor: manages one persistent worker session and workspace directory per ticket. */
 import type { Context } from '@deepseek-ai/cordis'
-import type { SessionId } from '@deepseek-ai/dsh-session'
+import type { Session, SessionId } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { mkdir, rmdir, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
@@ -14,8 +14,9 @@ import type { Store } from '../app/store.ts'
 import { Later, type Effects } from '../app/effects.ts'
 import { executionRoot, type Variable } from '../app/execution-environment.ts'
 import type { Sessions } from '../app/sessions.ts'
-import { WorktreeNameSchema } from '../app/assessment.ts'
+import { worktreeSegment } from '../app/assessment.ts'
 import { resultRelay } from '../app/notices.ts'
+import { freeSlot } from '../app/skill-ledger.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { cancelled, collectJob, killJobs, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
 
@@ -53,15 +54,15 @@ export function transient(error: unknown): boolean {
   const text = error instanceof Error ? `${error.name} ${error.message} ${String((error as { code?: unknown }).code ?? '')}` : String(error)
   return PASSING.test(text)
 }
-/** Appends a stable 12-character ticket ID suffix to a validated English worktree name. */
-const ticketWorktreeName = (name: string, id: string): string => `${WorktreeNameSchema.parse(name)}-${id.slice(0, 12)}`
+/** Appends a stable 12-character ticket ID suffix to a validated ticket name, folded into one safe directory name. */
+const ticketWorktreeName = (name: string, id: string): string => `${worktreeSegment(name)}-${id.slice(0, 12)}`
 /** Host dependencies used by `DshExecutor`. */
 export interface ExecutorHost {
   /** DSH Cordis context: agents and their events, and the subprocess service used to run prepare commands. */
   readonly context: Context
   /** Where the Executor reports what happened to Assignments and Inputs. */
   readonly engine: Pick<EngineForExecutor, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed' | 'report'
-    | 'assignmentInterrupted'>
+    | 'assignmentInterrupted' | 'assignmentFailed'>
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'set' | 'settings' | 'atomic' | 'afterCommit'>
   /** Durable effect queue through which launches and input deliveries run. */
   readonly effects: Pick<Effects, 'enqueue' | 'handle'>
@@ -70,7 +71,7 @@ export interface ExecutorHost {
   readonly machine: Pick<Machine, 'stateDir'>
   readonly lifetime: AbortSignal
   /** Session manager for worker sessions and for relaying worker reports to the main Session. */
-  readonly sessions: Pick<Sessions, 'ensure' | 'prompt' | 'promptedId' | 'relay' | 'holds'>
+  readonly sessions: Pick<Sessions, 'ensure' | 'prompt' | 'promptedId' | 'relay' | 'holds' | 'rebind'>
   closing(): boolean
   /** Whether processing is paused, which holds launches and input deliveries. */
   paused(): boolean
@@ -93,6 +94,9 @@ export function mandateInstructions(mandate: Pick<Mandate, 'strength'>): string 
     + 'internal to one module within the accepted rule scope. If it requires public-interface or behavior changes, new interaction, product '
     + 'decisions or clarification, stop and report dropped; do not expand scope.' : ''
 }
+/** The deliverable an installation without a GitHub repository can meet: `prompts/work.md` defers to an assignment that asks for a different one. */
+const LOCAL_DELIVERABLE = 'This installation has no GitHub repository: make no branch, push or pull request. Do the work in '
+  + 'DSH_SUPERAGENT_DIR, run the checks it needs, and report ready with the change there.\n'
 /** Builds a newly accepted ticket's Execution metadata: its worktree name, workspace directory, and assignment text. */
 export function ticketExecution(ticket: Ticket, outcome: Extract<AssessmentOutcome, { kind: 'accept' }>, settings: Settings,
   stateDir: string): Execution {
@@ -104,9 +108,10 @@ export function ticketExecution(ticket: Ticket, outcome: Extract<AssessmentOutco
     .map(rule => `\n- ${rule.name} (${rule.id}): ${rule.instruction}`).join('')
   const precedence = rules ? `\nMatched rules; their procedure and communication instructions take precedence over the default acknowledgement and messaging policy for this ticket:${rules}` : ''
   // The origin trigger is delivered alongside the assignment, so `assignment` omits the trigger text.
-  const assignment = ticket.mandate.strength === 'inferred' && ruleIds
+  const deliverable = String(settings.sources.github?.config.repository ?? '').trim() ? '' : LOCAL_DELIVERABLE
+  const assignment = `${deliverable}${ticket.mandate.strength === 'inferred' && ruleIds
     ? `Proactively accepted under ${ruleIds.join(', ')}. Scope: ${outcome.scope}.${precedence}${note}`
-    : note.trim()
+    : note.trim()}`
   return { name, directory: join(executionRoot(settings, stateDir), name), assignment }
 }
 /** Character limits for inline assignment and trigger text in worker messages; longer text is read via its resource. */
@@ -177,7 +182,9 @@ export class WorkerSlots {
    */
   constructor(private readonly running: () => string[], private readonly max: () => number) {}
   /** Number of slots currently in use across running workers and starting reservations. */
-  used(): number { return new Set([...this.running(), ...this.starting.keys()]).size }
+  used(): number { return this.holders().length }
+  /** The tickets that hold a slot: their worker runs, or a launch or wake starts it. */
+  holders(): string[] { return [...new Set([...this.running(), ...this.starting.keys()])] }
   /** How many launches may run concurrently: the slots not held by a running worker or a wake reservation. */
   launches(): number {
     const wakes = [...this.starting].flatMap(([ticketId, by]) => by !== 'launch' ? [ticketId] : [])
@@ -207,6 +214,8 @@ export class WorkerSlots {
 export class DshExecutor implements Executor {
   private readonly disposers: (() => void)[] = []
   private readonly slots: WorkerSlots
+  /** Last native error turn handled for each live Session; a duplicate must not end its replacement assignment. */
+  private readonly failedTurns = new WeakMap<Session, number>()
   /** Transient failure counts tried so far: keyed by `assignment.id` for worker turns and `launch:<assignment.id>` for launches. */
   private readonly transient = new Map<string, number>()
   /** Assignment IDs currently waiting on a transient-failure backoff timer before resuming their worker turn. */
@@ -272,7 +281,7 @@ export class DshExecutor implements Executor {
     const assignment = ticket && latestAssignment(ticket)
     if (!ticket || !liveTicket(ticket) || assignment?.id !== assignmentId || assignment.state !== 'pending') return
     this.slots.reserve(ticketId, 'launch')
-    try { await this.launch(ticket, assignment); this.transient.delete(`launch:${assignmentId}`) }
+    try { await this.launch(this.slotFor(ticketId) ?? ticket, assignment); this.transient.delete(`launch:${assignmentId}`) }
     catch (error) {
       // Shutdown or pause re-queues the launch for resume, and transient network/provider errors retry with backoff.
       // A failed prepare command is not retried automatically because an existing directory counts as prepared, so retrying
@@ -307,6 +316,8 @@ export class DshExecutor implements Executor {
           const person = ticket.undelivered.some(id => fromPerson(ticket.inputs.find(item => item.id === id)))
           this.slots.reserve(ticketId, person ? 'person' : 'wake')
           woken = true
+          // The woken worker takes its number back, or a free one, and its Session sees that slot's tree.
+          if (this.slotFor(ticketId)) await this.host.sessions.rebind(sessionId)
         }
         const input = ticket.inputs.find(item => item.id === inputId)
         try {
@@ -355,7 +366,7 @@ export class DshExecutor implements Executor {
    * report with no Input delivered since, and stops its shell jobs and subagents, including jobs it left to a person.
    */
   stop(ticket: Ticket, assignment: Assignment, reason: string): void {
-    this.transient.delete(assignment.id); this.transient.delete(`launch:${assignment.id}`)
+    this.transient.delete(assignment.id); this.transient.delete(`launch:${assignment.id}`); this.resuming.delete(assignment.id)
     const report = assignment.report
     const busy = !!assignment.deliveredAt && !!report && assignment.deliveredAt >= report.at
     const ownTurn = (report?.state === 'ready' || report?.state === 'dropped') && !busy
@@ -399,6 +410,28 @@ export class DshExecutor implements Executor {
       await Promise.allSettled(running.map(agent => agent.whenIdle()))
     }
     await until(stop(), undefined, SHUTDOWN_STOP_MS)
+  }
+  /**
+   * Gives a ticket that starts its worker a numbered slot and persists it as `execution.slot`: the number it had when no
+   * other worker that runs or starts holds it, else the lowest free one (see `freeSlot`). A number is held only while its
+   * ticket holds capacity in `WorkerSlots`, so numbers stay within the capacity limit and a ticket that ends or waits gives
+   * its number up; a wake, retry or restart takes the same number back while it is free. Call it synchronously right after
+   * the ticket's `WorkerSlots.reserve`, so two starts cannot pick the same number.
+   * @returns The stored ticket, or undefined when it is unknown, ended or has no execution.
+   */
+  private slotFor(ticketId: string): Ticket | undefined {
+    return this.host.store.atomic(() => {
+      const ticket = this.host.store.tickets.get(ticketId)
+      if (!ticket || !liveTicket(ticket) || !ticket.execution) return undefined
+      const holders = new Set(this.slots.holders())
+      const held = this.host.store.tickets.open().flatMap(other => other.id !== ticketId && holders.has(other.id)
+        && other.execution?.slot !== undefined ? [other.execution.slot] : [])
+      const slot = ticket.execution.slot
+      if (slot !== undefined && !held.includes(slot)) return ticket
+      const assigned = { ...ticket, execution: { ...ticket.execution, slot: freeSlot(held) } }
+      this.host.store.tickets.save(assigned)
+      return assigned
+    })
   }
   /** Number of open tickets whose worker holds a worker slot: its turn runs, or its shell jobs or subagents still run after its turn ended. */
   activeCount(): number { return this.host.store.tickets.open().filter(ticket => this.running(ticket)).length }
@@ -494,7 +527,28 @@ export class DshExecutor implements Executor {
     // history: a step that claimed it may be cancelled or fail before, which drops it.
     this.disposers.push(ctx.on('session/event', (session, event) => {
       const ticketId = ticketOfSession(session.id)
-      if (event.type !== 'user/message' || ticketId === undefined || event.data.source.kind !== 'dsh-superagent' || this.host.closing()) return
+      if (ticketId === undefined || this.host.closing()) return
+      if (event.type === 'turn/end' && event.data.reason.kind === 'error') {
+        // DSH records ordinary LLM failures here; agent/error alone does not cover them. A terminal turn has
+        // exhausted DSH's own retries, so close the assignment rather than treating its idle as a waiting report.
+        const agent = ctx.agents.get(session.id)
+        if (!agent || agent.session !== session || (this.failedTurns.get(session) ?? -1) >= event.data.turn) return
+        this.failedTurns.set(session, event.data.turn)
+        const ticket = this.host.store.tickets.get(ticketId)
+        const assignment = ticket && liveTicket(ticket) ? latestAssignment(ticket) : undefined
+        if (!assignment || assignment.state === 'ended') return
+        this.resuming.delete(assignment.id); this.transient.delete(assignment.id)
+        const summary = event.data.reason.error.message
+        void this.background(Promise.resolve().then(() => {
+          if (this.host.closing()) return
+          this.host.store.atomic(() => {
+            const updated = this.host.engine.assignmentFailed(ticketId, assignment.id, summary)
+            if (updated) this.relay(resultRelay(updated, 'failed', summary))
+          })
+        }))
+        return
+      }
+      if (event.type !== 'user/message' || event.data.source.kind !== 'dsh-superagent') return
       const message = event.data
       void this.background(Promise.resolve().then(() => {
         const read = this.host.store.tickets.get(ticketId)?.inputs.filter(input => input.kind === 'trigger' && !input.readAt
@@ -502,12 +556,17 @@ export class DshExecutor implements Executor {
         if (read.length) this.host.engine.inputsRead(ticketId, read)
       }))
     }))
-    this.disposers.push(ctx.on('agent/error', ({ agent, error }) => {
+    this.disposers.push(ctx.on('agent/error', ({ agent, error, turn }) => {
+      if ((this.failedTurns.get(agent.session) ?? -1) >= turn) return
       const ticket = this.ticketOf(agent)
       const assignment = ticket && runningAssignment(ticket)
       if (!ticket || !assignment || !liveTicket(ticket) || this.host.closing()) return
       if (this.retries(assignment.id, error)) { this.resumeAfter(ticket.id, assignment.id, error); return }
-      void this.background(Promise.resolve().then(() => { this.failed(ticket.id, String(error)) }))
+      void this.background(Promise.resolve().then(() => {
+        const current = this.host.store.tickets.get(ticket.id)
+        if (!this.host.closing() && (this.failedTurns.get(agent.session) ?? -1) < turn
+          && current && liveTicket(current) && runningAssignment(current)?.id === assignment.id) this.failed(ticket.id, String(error))
+      }))
     }))
   }
   /** Unsubscribes from host agent events and clears any pending transient-retry timers. */

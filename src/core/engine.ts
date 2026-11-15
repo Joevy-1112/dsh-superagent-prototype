@@ -193,6 +193,10 @@ export class Engine {
   turnEnded(ticketId: string, assignmentId: string): void {
     this.repo.atomic(() => { this.assignments.turnEnded(ticketId, assignmentId) })
   }
+  /** A native worker turn failed: end only that assignment and leave its failed report available for retry. */
+  assignmentFailed(ticketId: string, assignmentId: string, error: string): Ticket | undefined {
+    return this.repo.atomic(() => this.assignments.failed(ticketId, assignmentId, error))
+  }
   /** The Executor's fact that delivering Inputs to the Assignment that runs the ticket failed; the ticket shows it until a delivery succeeds. */
   deliveryFailed(ticketId: string, assignmentId: string, error: string): void {
     this.repo.atomic(() => { this.assignments.deliveryFailed(ticketId, assignmentId, error) })
@@ -267,4 +271,4 @@ export type EngineForPeople = Pick<Engine, 'stopTicket' | 'retryTicket' | 'reeva
 export type EngineForSettings = Pick<Engine, 'policyChanged'>
 /** What the Executor tells the Engine, and what its workers ask of it. */
 export type EngineForExecutor = Pick<Engine, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed'
-  | 'assignmentInterrupted' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'reply'>
+  | 'assignmentInterrupted' | 'assignmentFailed' | 'report' | 'markUnrelated' | 'handback' | 'followForContext' | 'reply'>

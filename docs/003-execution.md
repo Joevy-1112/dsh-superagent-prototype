@@ -60,6 +60,8 @@ The configured concurrency limit applies to these slots, with one extra slot for
 
 Other Inputs, such as CI results, wait for a normal slot. A launch waits in `working / queued` until a slot is free. Launches run concurrently, so a slow prepare command delays only its own Ticket.
 
+The first launch or wake also gives the Ticket a numbered slot, the lowest one no other open Ticket holds, stored with its execution. The Ticket keeps that number across wakes, retries and restarts, and its worker's private skill tree is `workers/slot-<n+1>/`. When the Ticket ends, the number is free for the next launch.
+
 ### Execution variables
 
 The prepare command and Executor instructions receive the same execution variables. The command reads environment variables; the Executor reads their values and descriptions in its prompt. None contains credentials.

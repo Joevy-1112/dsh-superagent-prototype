@@ -5,6 +5,7 @@ import { Later } from '../src/app/effects.ts'
 import { reportRelay } from '../src/app/notices.ts'
 import { WorkerSlots, inputMessage, mandateInstructions, ticketExecution, transient, triggerMessage } from '../src/executor/dsh.ts'
 import { SettingsSchema } from '../src/policy.ts'
+import { freeSlot, workerSlotName } from '../src/app/skill-ledger.ts'
 import { Commands } from '../src/infra/commands.ts'
 import { deferred, waitUntil } from './fixtures/async.ts'
 import { CHAT, MEMBER, feishu, startRuntime, type Host } from './fixtures/host.ts'
@@ -881,8 +882,9 @@ describe('the Executor\'s parts', () => {
     expect(slots.used()).toBe(4)
   })
   it('words an assignment, and the limits an inferred mandate sets, from the ticket alone', () => {
-    const settings = SettingsSchema.parse({ policy: { rules: [{ id: 'copy', name: 'Copy fixes', enabled: true,
-      instruction: 'Fix typos only.' }] } })
+    const settings = SettingsSchema.parse({ sources: { github: { enabled: true, config: { repository: 'acme/widgets' } } },
+      policy: { rules: [{ id: 'copy', name: 'Copy fixes', enabled: true,
+        instruction: 'Fix typos only.' }] } })
     const ticket = { id: 'ticket-0123456789abcdef', origin: { triggerId: 'tr1', triggerIds: [] },
       mandate: { strength: 'inferred', policyVersion: 'v1', basis: { rules: ['copy'] }, actor: { source: 'github', id: 'alice' },
         scope: '' } } as unknown as Ticket
@@ -899,6 +901,9 @@ describe('the Executor\'s parts', () => {
     // The worker's system prompt holds the limits an inferred Mandate sets, so the assignment does not repeat them.
     expect(execution.assignment).not.toContain(mandateInstructions(ticket.mandate))
     expect(execution.assignment).toContain('- Copy fixes (copy): Fix typos only.')
+    // An installation without a GitHub repository states the deliverable it can meet, so the worker does not wait for a PR.
+    expect(ticketExecution(ticket, { kind: 'accept', title: 'Fix', scope: 'the typo', reason: 'r', name: 'fix-typo' } as never,
+      SettingsSchema.parse({ policy: settings.policy }), '/state').assignment).toContain('no GitHub repository')
     expect(mandateInstructions({ strength: 'explicit' })).toBe('')
   })
   it('renders each kind of Input as its worker reads it, inline, and no reopen Input', () => {
@@ -939,5 +944,46 @@ describe('the Executor\'s parts', () => {
       answers: 'tr9' })!
     expect(ready.id).toMatch(/^report:/)
     expect(JSON.parse(ready.text)).toMatchObject({ kind: 'worker_report', ticket: { ticket_id: 't1' }, trigger_id: 'tr1', state: 'ready', answer_to: 'tr9', summary: 'Done' })
+  })
+})
+
+describe('worker slots', () => {
+  const slotOf = (ticketId: string) => h.runtime.store.tickets.get(ticketId)?.execution?.slot
+  it('names a slot\'s tree as earlier versions did, and gives the lowest slot no other worker holds', () => {
+    expect([0, 1, 2].map(workerSlotName)).toEqual(['slot-1', 'slot-2', 'slot-3'])
+    expect(freeSlot([])).toBe(0)
+    expect(freeSlot([0, 2])).toBe(1)
+    expect(freeSlot([1, 0])).toBe(2)
+  })
+  it('gives concurrent workers their own slots, keeps one across a retry, and gives a stopped ticket\'s slot to the next launch', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    const two = await h.acceptedTicket(feishu('5', '@bot 修二'))
+    await vi.waitFor(() => expect([slotOf(one.ticket.id), slotOf(two.ticket.id)]).toEqual([0, 1]))
+    // A retry starts a new Assignment in the same slot.
+    h.runtime.engine.deliveryFailed(one.ticket.id, latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)!.id, 'Session busy')
+    h.runtime.engine.retryTicket(one.ticket.id); await h.runtime.idle()
+    await vi.waitFor(() => expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)).toMatchObject({ state: 'running' }))
+    expect(slotOf(one.ticket.id)).toBe(0)
+    // Stopping the first frees slot 0, which the next launch takes; the second keeps slot 1.
+    h.runtime.engine.stopTicket(one.ticket.id); await h.runtime.idle()
+    const three = await h.acceptedTicket(feishu('9', '@bot 修三'))
+    await vi.waitFor(() => expect(slotOf(three.ticket.id)).toBe(0))
+    expect(slotOf(two.ticket.id)).toBe(1)
+  })
+  it('keeps slots within the limit: a worker that waits gives its slot up, and takes it back on a wake while it is free', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    await vi.waitFor(() => expect(slotOf(one.ticket.id)).toBe(0))
+    // Its turn ends with nothing running: it waits and holds no slot, so the next launch takes slot 0.
+    idle(one.sessionId); await h.runtime.idle()
+    const two = await h.acceptedTicket(feishu('5', '@bot 修二'))
+    await vi.waitFor(() => expect(slotOf(two.ticket.id)).toBe(0))
+    // A person's message wakes the first: slot 0 is held, so it takes the lowest free one.
+    h.runtime.receive(feishu('2', '一的补充', { mentions: [], root_id: 'om_1' })); await h.runtime.idle()
+    await vi.waitFor(() => expect(slotOf(one.ticket.id)).toBe(1))
+    // Once both wait, a wake of the second takes its own slot back.
+    idle(one.sessionId); idle(two.sessionId); await h.runtime.idle()
+    h.runtime.receive(feishu('6', '二的补充', { mentions: [], root_id: 'om_5' })); await h.runtime.idle()
+    await vi.waitFor(() => expect(h.deliveries.mock.calls.some(([item]) => item.sessionId === two.sessionId && item.text.includes('二的补充'))).toBe(true))
+    expect(slotOf(two.ticket.id)).toBe(0)
   })
 })

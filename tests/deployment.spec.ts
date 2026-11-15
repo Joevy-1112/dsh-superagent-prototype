@@ -65,11 +65,21 @@ describe('setup', () => {
     // A renamed repository is still resolved by its old name; notifications carry GitHub's current full_name.
     expect((await resolveDeployment(machine(), { repository: 'acme/gadgets', cli: 'gh' }, probe, path)).repository).toBe('acme/widgets')
   })
+  it('resolves local mode when the GitHub Source names no repository, without probing a CLI', async () => {
+    const probed: string[][] = []
+    const probe: Probe = async argv => { probed.push(argv); throw new Error('local mode must not probe') }
+    // A CLI name that does not exist is left alone too: local mode needs no GitHub account.
+    const local = await resolveDeployment(machine(), { cli: 'gh-that-is-not-installed' }, probe, path)
+    expect(local).toMatchObject({ repository: '' })
+    expect(local.github).toBeUndefined()
+    expect(local).not.toHaveProperty('feishu')
+    expect(probed).toEqual([])
+    expect((await resolveDeployment(machine(), {}, probe, path)).repository).toBe('')
+  })
   it('names what setup needs and where it is set', async () => {
     const needs = (place: string, code: string, values: Record<string, unknown>, github: unknown) =>
       expect(resolveDeployment(machine(), github, probe, path)).rejects.toEqual(setupError(place, code, values))
     const repository = 'acme/widgets'
-    await needs('github', 'repositoryUnset', {}, { cli: 'gh' })
     await needs('github', 'agentCliUnset', {}, { repository })
     await needs('github', 'agentCliMissing', { output: `${join(dir, 'missing')} is not an executable file` }, { repository, cli: join(dir, 'missing') })
     await needs('github', 'agentCliMissing', { output: 'bin/gh must be a command name or an absolute path' }, { repository, cli: 'bin/gh' })

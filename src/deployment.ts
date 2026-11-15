@@ -50,9 +50,16 @@ export const FeishuBotSchema = z.object({ cli: z.string().trim().default('') })
 /** Source configuration keys that affect deployment setup and trigger a restart when changed. */
 export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = { github: Object.keys(GithubAccountsSchema.shape), feishu: Object.keys(FeishuBotSchema.shape) }
 
+/**
+ * Deployment of one dsh-superagent installation.
+ * `repository` is empty, and `github` absent, in local mode: the GitHub Source names no repository, so no
+ * repository access or agent account is verified and only the other Sources (such as Feishu) run.
+ */
 export interface Deployment extends Machine {
+  /** Canonical `owner/name` of the watched repository, or `''` in local mode. */
   repository: string
-  github: { cli: string; login: string; noreply: string }
+  /** The agent's GitHub account; absent in local mode, where nothing reaches GitHub as the agent. */
+  github?: { cli: string; login: string; noreply: string }
   feishu?: FeishuBot
 }
 export interface FeishuBot { cli: string; appId: string; brand: 'feishu' | 'lark'; botId: string; name: string }
@@ -83,12 +90,17 @@ function parsed<T>(schema: z.ZodType<T>, text: string): T | undefined {
   const result = schema.safeParse(value)
   return result.success ? result.data : undefined
 }
-/** Verify the agent's GitHub CLI identity and push access to the configured repository. */
+/**
+ * Verify the agent's GitHub CLI identity and push access to the configured repository, or return local mode when the
+ * GitHub Source names no repository.
+ * Local mode is a supported deployment, not a setup failure: the Sources that need no repository (such as Feishu) run,
+ * the GitHub Source reports the missing repository itself, and nothing is probed, so no `gh` account is required.
+ */
 export async function resolveDeployment(machine: Machine, github: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
   const { stateDir } = machine
   const accounts = GithubAccountsSchema.parse(github ?? {})
   const remote = accounts.repository
-  if (!remote) throw new SetupError('repositoryUnset')
+  if (!remote) return { ...machine, repository: '' }
   if (!accounts.cli) throw new SetupError('agentCliUnset')
   let cli: string
   try { cli = executable(accounts.cli, path, workerBin(stateDir)) } catch (error) { throw new SetupError('agentCliMissing', { output: reason(error) }) }

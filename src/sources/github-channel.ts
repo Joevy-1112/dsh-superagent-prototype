@@ -18,6 +18,8 @@ const missing = (error: unknown): boolean => error instanceof CliError && (error
 export async function sendGithub(host: Pick<SourceContext, 'commands'>, message: OutboundMessage): Promise<'sent' | 'gone'> {
   const { commands } = host
   const { repository, github } = commands.deployment
+  // Local mode receives no GitHub message, so a reply there means the deployment changed after the message was queued.
+  if (!github) throw new Error('This installation has no GitHub account, so it cannot reply on GitHub')
   const number = Number(message.channel.address.number)
   if (!number) throw new Error('Missing GitHub reply target')
   try {
