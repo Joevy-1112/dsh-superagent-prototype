@@ -949,13 +949,13 @@ describe('the Executor\'s parts', () => {
 
 describe('worker slots', () => {
   const slotOf = (ticketId: string) => h.runtime.store.tickets.get(ticketId)?.execution?.slot
-  it('names a slot\'s tree as earlier versions did, and gives the lowest slot no other open ticket holds', () => {
+  it('names a slot\'s tree as earlier versions did, and gives the lowest slot no other worker holds', () => {
     expect([0, 1, 2].map(workerSlotName)).toEqual(['slot-1', 'slot-2', 'slot-3'])
     expect(freeSlot([])).toBe(0)
     expect(freeSlot([0, 2])).toBe(1)
     expect(freeSlot([1, 0])).toBe(2)
   })
-  it('gives concurrent tickets their own slots at launch, keeps them across a retry, and gives a stopped ticket\'s slot to the next', async () => {
+  it('gives concurrent workers their own slots, keeps one across a retry, and gives a stopped ticket\'s slot to the next launch', async () => {
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
     const two = await h.acceptedTicket(feishu('5', '@bot 修二'))
     await vi.waitFor(() => expect([slotOf(one.ticket.id), slotOf(two.ticket.id)]).toEqual([0, 1]))
@@ -964,23 +964,26 @@ describe('worker slots', () => {
     h.runtime.engine.retryTicket(one.ticket.id); await h.runtime.idle()
     await vi.waitFor(() => expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)).toMatchObject({ state: 'running' }))
     expect(slotOf(one.ticket.id)).toBe(0)
-    expect(h.runtime.executor.slotFor(one.ticket.id)?.execution?.slot).toBe(0)
     // Stopping the first frees slot 0, which the next launch takes; the second keeps slot 1.
     h.runtime.engine.stopTicket(one.ticket.id); await h.runtime.idle()
-    expect(h.runtime.executor.slotFor(one.ticket.id)).toBeUndefined()
     const three = await h.acceptedTicket(feishu('9', '@bot 修三'))
     await vi.waitFor(() => expect(slotOf(three.ticket.id)).toBe(0))
     expect(slotOf(two.ticket.id)).toBe(1)
   })
-  it('keeps the slot a restart finds on a running ticket, and gives one to a running ticket persisted without it', async () => {
+  it('keeps slots within the limit: a worker that waits gives its slot up, and takes it back on a wake while it is free', async () => {
     const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    await vi.waitFor(() => expect(slotOf(one.ticket.id)).toBe(0))
+    // Its turn ends with nothing running: it waits and holds no slot, so the next launch takes slot 0.
+    idle(one.sessionId); await h.runtime.idle()
     const two = await h.acceptedTicket(feishu('5', '@bot 修二'))
-    await vi.waitFor(() => expect(slotOf(two.ticket.id)).toBe(1))
-    // An older version left the first ticket running with no slot; the second keeps slot 1 and the first takes slot 0.
-    const stored = h.runtime.store.tickets.get(one.ticket.id)!
-    const { slot: _slot, ...execution } = stored.execution!
-    h.runtime.store.tickets.save({ ...stored, execution })
-    h.runtime.executor.resume(); await h.runtime.idle()
-    expect([slotOf(one.ticket.id), slotOf(two.ticket.id)]).toEqual([0, 1])
+    await vi.waitFor(() => expect(slotOf(two.ticket.id)).toBe(0))
+    // A person's message wakes the first: slot 0 is held, so it takes the lowest free one.
+    h.runtime.receive(feishu('2', '一的补充', { mentions: [], root_id: 'om_1' })); await h.runtime.idle()
+    await vi.waitFor(() => expect(slotOf(one.ticket.id)).toBe(1))
+    // Once both wait, a wake of the second takes its own slot back.
+    idle(one.sessionId); idle(two.sessionId); await h.runtime.idle()
+    h.runtime.receive(feishu('6', '二的补充', { mentions: [], root_id: 'om_5' })); await h.runtime.idle()
+    await vi.waitFor(() => expect(h.deliveries.mock.calls.some(([item]) => item.sessionId === two.sessionId && item.text.includes('二的补充'))).toBe(true))
+    expect(slotOf(two.ticket.id)).toBe(0)
   })
 })

@@ -69,6 +69,20 @@ export class Assignments extends EnginePart {
     runningAssignment(ticket)!.idleAt = this.now()
     this.repo.tickets.save(ticket)
   }
+  /** A native error turn is terminal for this assignment, not a worker's voluntary failed report. */
+  failed(ticketId: string, assignmentId: string, error: string): Ticket | undefined {
+    const ticket = this.require(ticketId)
+    const assignment = latestAssignment(ticket)
+    // A first turn can fail before its launch delivery has acknowledged assignmentStarted.
+    if (!liveTicket(ticket) || assignment?.id !== assignmentId || assignment.state === 'ended') return
+    this.report(ticketId, { state: 'failed', summary: error })
+    const updated = this.require(ticketId), failed = latestAssignment(updated)!
+    failed.state = 'ended'; failed.endedAt = this.now(); failed.endedReason = 'error'
+    this.repo.tickets.save(updated)
+    this.emit('assignment.ended', { ticketId, assignmentId, reason: 'error' })
+    this.options.executor.stop(updated, failed, 'error')
+    return updated
+  }
   deliveryFailed(ticketId: string, assignmentId: string, error: string): void {
     const ticket = this.running(ticketId, assignmentId)
     if (!ticket) return

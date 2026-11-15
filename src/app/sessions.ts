@@ -39,11 +39,6 @@ export interface SessionsHost {
   environment(ticket: Ticket): Variable[]
   /** Tools to register on the main Session (`ticket === undefined`) or on `ticket`'s worker Session. */
   tools(agent: Agent, ticket?: Ticket): Tool[]
-  /**
-   * The worker slot of an open ticket, given and persisted on first use (see `DshExecutor.slotFor`); undefined for an
-   * ended or unknown ticket, whose Session then sees no private skill tree.
-   */
-  workerSlot(ticketId: string): number | undefined
 }
 
 /**
@@ -171,6 +166,11 @@ export class Sessions {
     await ctx.sessionController.rename({ sessionId: id as SessionId, title })
     return result.agent
   }
+  /** Decorates a loaded Session again, so a worker whose ticket took another slot sees that slot's private skill tree. */
+  async rebind(sessionId: string): Promise<void> {
+    const agent = this.ctx.agents.get(sessionId as SessionId)
+    if (agent) await this.decorate(agent)
+  }
   /** Returns whether `sessionId` already holds the message delivered under `requestId`, or `false` if the session does not exist. */
   async holds(sessionId: string, requestId: string): Promise<boolean> {
     const result = await this.ctx.sessionController.resolveAgent(sessionId as SessionId)
@@ -253,10 +253,10 @@ export class Sessions {
     const ticket = master ? undefined : this.ticketOf(agent)
     // The worker's own skill tree, named by the slot the Executor gave its ticket: it alone sees these drafts, and every
     // load it makes is counted for promotion under that slot.
-    const slot = ticket ? host.workerSlot(ticket.id) : undefined
+    const slot = ticket?.execution?.slot
     const worker = slot === undefined ? undefined : workerSlotName(slot)
     const bound = this.bindings.get(agent)
-    // A ticket that ended and resumed into another slot rebinds its Session to that slot's tree.
+    // A worker the Executor started in another slot than its Session was bound to rebinds to that slot's tree.
     if (bound && (bound.subagent || master || !worker || bound.worker === worker)) return
     if (bound) this.release(agent)
     if (!master && !ticket) { this.limitSubagent(agent); return }

@@ -1,6 +1,6 @@
 /** DSH executor: manages one persistent worker session and workspace directory per ticket. */
 import type { Context } from '@deepseek-ai/cordis'
-import type { SessionId } from '@deepseek-ai/dsh-session'
+import type { Session, SessionId } from '@deepseek-ai/dsh-session'
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import { mkdir, rmdir, stat } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
@@ -62,7 +62,7 @@ export interface ExecutorHost {
   readonly context: Context
   /** Where the Executor reports what happened to Assignments and Inputs. */
   readonly engine: Pick<EngineForExecutor, 'assignmentStarted' | 'inputsDelivered' | 'inputsRead' | 'turnEnded' | 'deliveryFailed' | 'report'
-    | 'assignmentInterrupted'>
+    | 'assignmentInterrupted' | 'assignmentFailed'>
   readonly store: Pick<Store, 'tickets' | 'triggers' | 'set' | 'settings' | 'atomic' | 'afterCommit'>
   /** Durable effect queue through which launches and input deliveries run. */
   readonly effects: Pick<Effects, 'enqueue' | 'handle'>
@@ -71,7 +71,7 @@ export interface ExecutorHost {
   readonly machine: Pick<Machine, 'stateDir'>
   readonly lifetime: AbortSignal
   /** Session manager for worker sessions and for relaying worker reports to the main Session. */
-  readonly sessions: Pick<Sessions, 'ensure' | 'prompt' | 'promptedId' | 'relay' | 'holds'>
+  readonly sessions: Pick<Sessions, 'ensure' | 'prompt' | 'promptedId' | 'relay' | 'holds' | 'rebind'>
   closing(): boolean
   /** Whether processing is paused, which holds launches and input deliveries. */
   paused(): boolean
@@ -182,7 +182,9 @@ export class WorkerSlots {
    */
   constructor(private readonly running: () => string[], private readonly max: () => number) {}
   /** Number of slots currently in use across running workers and starting reservations. */
-  used(): number { return new Set([...this.running(), ...this.starting.keys()]).size }
+  used(): number { return this.holders().length }
+  /** The tickets that hold a slot: their worker runs, or a launch or wake starts it. */
+  holders(): string[] { return [...new Set([...this.running(), ...this.starting.keys()])] }
   /** How many launches may run concurrently: the slots not held by a running worker or a wake reservation. */
   launches(): number {
     const wakes = [...this.starting].flatMap(([ticketId, by]) => by !== 'launch' ? [ticketId] : [])
@@ -212,6 +214,8 @@ export class WorkerSlots {
 export class DshExecutor implements Executor {
   private readonly disposers: (() => void)[] = []
   private readonly slots: WorkerSlots
+  /** Last native error turn handled for each live Session; a duplicate must not end its replacement assignment. */
+  private readonly failedTurns = new WeakMap<Session, number>()
   /** Transient failure counts tried so far: keyed by `assignment.id` for worker turns and `launch:<assignment.id>` for launches. */
   private readonly transient = new Map<string, number>()
   /** Assignment IDs currently waiting on a transient-failure backoff timer before resuming their worker turn. */
@@ -312,7 +316,8 @@ export class DshExecutor implements Executor {
           const person = ticket.undelivered.some(id => fromPerson(ticket.inputs.find(item => item.id === id)))
           this.slots.reserve(ticketId, person ? 'person' : 'wake')
           woken = true
-          this.slotFor(ticketId)
+          // The woken worker takes its number back, or a free one, and its Session sees that slot's tree.
+          if (this.slotFor(ticketId)) await this.host.sessions.rebind(sessionId)
         }
         const input = ticket.inputs.find(item => item.id === inputId)
         try {
@@ -361,7 +366,7 @@ export class DshExecutor implements Executor {
    * report with no Input delivered since, and stops its shell jobs and subagents, including jobs it left to a person.
    */
   stop(ticket: Ticket, assignment: Assignment, reason: string): void {
-    this.transient.delete(assignment.id); this.transient.delete(`launch:${assignment.id}`)
+    this.transient.delete(assignment.id); this.transient.delete(`launch:${assignment.id}`); this.resuming.delete(assignment.id)
     const report = assignment.report
     const busy = !!assignment.deliveredAt && !!report && assignment.deliveredAt >= report.at
     const ownTurn = (report?.state === 'ready' || report?.state === 'dropped') && !busy
@@ -407,17 +412,20 @@ export class DshExecutor implements Executor {
     await until(stop(), undefined, SHUTDOWN_STOP_MS)
   }
   /**
-   * Gives an open ticket its worker slot and persists it as `execution.slot`, or keeps the one it has: the lowest slot no
-   * other open ticket holds (see `freeSlot`). A ticket keeps its slot across wakes, retries and restarts; ending frees it,
-   * since only open tickets hold slots, and a ticket resumed after another took its slot gets a free one. Runs synchronously
-   * right after a slot reservation, so two starts cannot pick the same slot.
+   * Gives a ticket that starts its worker a numbered slot and persists it as `execution.slot`: the number it had when no
+   * other worker that runs or starts holds it, else the lowest free one (see `freeSlot`). A number is held only while its
+   * ticket holds capacity in `WorkerSlots`, so numbers stay within the capacity limit and a ticket that ends or waits gives
+   * its number up; a wake, retry or restart takes the same number back while it is free. Call it synchronously right after
+   * the ticket's `WorkerSlots.reserve`, so two starts cannot pick the same number.
    * @returns The stored ticket, or undefined when it is unknown, ended or has no execution.
    */
-  slotFor(ticketId: string): Ticket | undefined {
+  private slotFor(ticketId: string): Ticket | undefined {
     return this.host.store.atomic(() => {
       const ticket = this.host.store.tickets.get(ticketId)
       if (!ticket || !liveTicket(ticket) || !ticket.execution) return undefined
-      const held = this.host.store.tickets.open().flatMap(other => other.id !== ticketId && other.execution?.slot !== undefined ? [other.execution.slot] : [])
+      const holders = new Set(this.slots.holders())
+      const held = this.host.store.tickets.open().flatMap(other => other.id !== ticketId && holders.has(other.id)
+        && other.execution?.slot !== undefined ? [other.execution.slot] : [])
       const slot = ticket.execution.slot
       if (slot !== undefined && !held.includes(slot)) return ticket
       const assigned = { ...ticket, execution: { ...ticket.execution, slot: freeSlot(held) } }
@@ -519,7 +527,28 @@ export class DshExecutor implements Executor {
     // history: a step that claimed it may be cancelled or fail before, which drops it.
     this.disposers.push(ctx.on('session/event', (session, event) => {
       const ticketId = ticketOfSession(session.id)
-      if (event.type !== 'user/message' || ticketId === undefined || event.data.source.kind !== 'dsh-superagent' || this.host.closing()) return
+      if (ticketId === undefined || this.host.closing()) return
+      if (event.type === 'turn/end' && event.data.reason.kind === 'error') {
+        // DSH records ordinary LLM failures here; agent/error alone does not cover them. A terminal turn has
+        // exhausted DSH's own retries, so close the assignment rather than treating its idle as a waiting report.
+        const agent = ctx.agents.get(session.id)
+        if (!agent || agent.session !== session || (this.failedTurns.get(session) ?? -1) >= event.data.turn) return
+        this.failedTurns.set(session, event.data.turn)
+        const ticket = this.host.store.tickets.get(ticketId)
+        const assignment = ticket && liveTicket(ticket) ? latestAssignment(ticket) : undefined
+        if (!assignment || assignment.state === 'ended') return
+        this.resuming.delete(assignment.id); this.transient.delete(assignment.id)
+        const summary = event.data.reason.error.message
+        void this.background(Promise.resolve().then(() => {
+          if (this.host.closing()) return
+          this.host.store.atomic(() => {
+            const updated = this.host.engine.assignmentFailed(ticketId, assignment.id, summary)
+            if (updated) this.relay(resultRelay(updated, 'failed', summary))
+          })
+        }))
+        return
+      }
+      if (event.type !== 'user/message' || event.data.source.kind !== 'dsh-superagent') return
       const message = event.data
       void this.background(Promise.resolve().then(() => {
         const read = this.host.store.tickets.get(ticketId)?.inputs.filter(input => input.kind === 'trigger' && !input.readAt
@@ -527,12 +556,17 @@ export class DshExecutor implements Executor {
         if (read.length) this.host.engine.inputsRead(ticketId, read)
       }))
     }))
-    this.disposers.push(ctx.on('agent/error', ({ agent, error }) => {
+    this.disposers.push(ctx.on('agent/error', ({ agent, error, turn }) => {
+      if ((this.failedTurns.get(agent.session) ?? -1) >= turn) return
       const ticket = this.ticketOf(agent)
       const assignment = ticket && runningAssignment(ticket)
       if (!ticket || !assignment || !liveTicket(ticket) || this.host.closing()) return
       if (this.retries(assignment.id, error)) { this.resumeAfter(ticket.id, assignment.id, error); return }
-      void this.background(Promise.resolve().then(() => { this.failed(ticket.id, String(error)) }))
+      void this.background(Promise.resolve().then(() => {
+        const current = this.host.store.tickets.get(ticket.id)
+        if (!this.host.closing() && (this.failedTurns.get(agent.session) ?? -1) < turn
+          && current && liveTicket(current) && runningAssignment(current)?.id === assignment.id) this.failed(ticket.id, String(error))
+      }))
     }))
   }
   /** Unsubscribes from host agent events and clears any pending transient-retry timers. */
@@ -549,8 +583,6 @@ export class DshExecutor implements Executor {
   resume(): void {
     // Launch pending tickets oldest first (in acceptance order).
     for (const ticket of this.host.store.tickets.open().sort((a, b) => a.createdAt.localeCompare(b.createdAt))) {
-      // A ticket whose worker ran before slots were persisted gets one now, so its worker keeps the same tree from here on.
-      if (runningAssignment(ticket)) this.slotFor(ticket.id)
       const running = runningAssignment(ticket), latest = latestAssignment(ticket)
       if (running) {
         // A restart within this process left DSH's Sessions, jobs and subagents running: they stop first. The inbox keeps an
