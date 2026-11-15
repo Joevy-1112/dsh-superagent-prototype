@@ -5,6 +5,8 @@ import type { MessageId } from '@deepseek-ai/dsh-llm'
 import { scopeParentOf } from '@deepseek-ai/dsh-scope'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import { dirname } from 'node:path'
+import { mkdir } from 'node:fs/promises'
+import { watch } from 'node:fs'
 import { z } from 'zod'
 import { key, liveTicket, type Ticket } from '../core/index.ts'
 import { mandateInstructions, ticketOfSession } from '../executor/dsh.ts'
@@ -15,6 +17,7 @@ import type { Variable } from './execution-environment.ts'
 import { RetryHealth } from './retry-health.ts'
 import { initializeRoleModel } from './role-models.ts'
 import { bundledSkills } from './skill-files.ts'
+import { createSkillRecorder, readPrivateSkills, skillNameOf, workerSkillDir, workerSlotId } from './skill-ledger.ts'
 import { SKILL_PREFIX, type PromptVersion, type Prompts } from './prompts.ts'
 import type { Store } from './store.ts'
 import { KV } from '../kv.ts'
@@ -101,6 +104,8 @@ export class Sessions {
   /** Decorated agents mapped to their registered disposers and skill scope until the agent is disposed or `Sessions.dispose()` runs. */
   private readonly bindings = new Map<Agent, SessionBinding>()
   private readonly retryHealth = new RetryHealth()
+  /** Appends one line per `skill` tool call so promotion can count what workers really used. */
+  private readonly recordSkillUse = createSkillRecorder((message: string) => this.ctx.logger.warn('%s', message))
   private readonly ctx: Context
   /** Registers ordered `relay` and `notice` effect handlers that deliver to the main Session. */
   constructor(private readonly host: SessionsHost) {
@@ -241,6 +246,8 @@ export class Sessions {
     const master = agent.id === host.masterId
     const ticket = master ? undefined : this.ticketOf(agent)
     if (!master && !ticket) { this.limitSubagent(agent); return }
+    // The worker's own skill tree: it alone sees these drafts, and every load it makes is counted for promotion.
+    const worker = ticket ? workerSlotId(ticket.id, host.store.settings().executor.maxWorkers ?? 2) : undefined
     const binding: SessionBinding = { disposers: [] }
     this.bindings.set(agent, binding)
     this.retryHealth.restore(agent.id, agent.session.snapshotEvents())
@@ -251,7 +258,11 @@ export class Sessions {
       const version = this.promptFor(agent, context.signal !== undefined)
       const current = ticket && host.store.tickets.get(ticket.id)
       const composed = host.prompts.compose(version.config, master ? 'orchestrator' : 'worker', current ? host.environment(current) : undefined)
-      return `[dsh-superagent prompt revision ${version.revision}]\n${composed}\n${current ? mandateInstructions(current.mandate) : ''}`
+      const privateSkills = worker
+        ? `\nPrivate skill directory: ${workerSkillDir(worker)} — a method you use twice or more belongs there as `
+          + `<name>/SKILL.md; you alone see those drafts, and only promoted ones reach the shared library.`
+        : ''
+      return `[dsh-superagent prompt revision ${version.revision}]\n${composed}\n${current ? mandateInstructions(current.mandate) : ''}${privateSkills}`
     }, ...(master ? { complete: true } : {}) }))
     // A recreated skill scope (e.g. after the skills service restarts) starts empty, so reset `binding.skills` before rebinding.
     const skillScope = agent.ctx.inject(['skills'], scope => {
@@ -263,6 +274,38 @@ export class Sessions {
     await skillScope
     // Bail out if the agent was disposed while awaiting the skill scope.
     if (this.bindings.get(agent) !== binding) return
+    // An Executor Session also sees its own private skill tree, and every `skill` load it performs is recorded so the
+    // promotion chain has evidence from the workers that actually used a skill (DSH keeps no such counters).
+    if (worker && binding.scope) {
+      const scope = binding.scope
+      const directory = workerSkillDir(worker)
+      // The worker writes drafts while it runs, so the catalog is rebuilt whenever its tree changes — a draft written
+      // mid-session is addressable at once instead of only in the next session.
+      let privateDisposers: (() => void)[] = []
+      let pending: ReturnType<typeof setTimeout> | undefined
+      const rebind = async (): Promise<void> => {
+        for (const dispose of privateDisposers) dispose()
+        privateDisposers = await this.bindPrivateSkills(scope, directory)
+      }
+      await mkdir(directory, { recursive: true })
+      await rebind()
+      const watcher = watch(directory, { recursive: true }, () => {
+        if (pending) clearTimeout(pending)
+        pending = setTimeout(() => { void rebind() }, 300)
+      })
+      binding.disposers.push(() => {
+        if (pending) clearTimeout(pending)
+        watcher.close()
+        for (const dispose of privateDisposers) dispose()
+      })
+      // Count only loads that succeeded: a miss (`unknown or no longer available`) is not usage evidence.
+      binding.disposers.push(agent.ctx.on('tools/result', (execution, result) => {
+        if (execution.name !== 'skill') return
+        if ((result as { isError?: boolean } | undefined)?.isError) return
+        const skill = skillNameOf(execution.arguments)
+        if (skill) this.recordSkillUse({ ts: new Date().toISOString(), skill, worker, session: agent.id, ticket: ticket?.id })
+      }))
+    }
     const register = this.registerTool(agent, binding)
     for (const tool of host.tools(agent, ticket)) register(tool.name, tool.description, tool.schema, tool.execute)
     if (master) {
@@ -330,6 +373,17 @@ export class Sessions {
         ...(bundled ? { resourceBase: { kind: 'directory' as const, path: dirname(bundled.path) } } : {}) }))
     }
     binding.skills = { revision: version.revision, dispose: () => { disposers.forEach(dispose => dispose()) } }
+  }
+  /**
+   * Registers a worker's private skills into its own skill scope. Registration is by name, so a private draft shadows the
+   * shared skill of the same name for that worker only — the shared catalog stays untouched for everyone else.
+   */
+  private async bindPrivateSkills(scope: Context, directory: string): Promise<(() => void)[]> {
+    const disposers: (() => void)[] = []
+    for (const skill of await readPrivateSkills(directory)) {
+      disposers.push(scope.skills.register({ name: skill.name, description: skill.description, content: skill.content, source: 'runtime' }))
+    }
+    return disposers
   }
   /** Return the current prompt version, updating the agent's skills and recording the revision in Store when bound to a model request. */
   private promptFor(agent: Agent, bind: boolean): PromptVersion {

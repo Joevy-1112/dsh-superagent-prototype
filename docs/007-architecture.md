@@ -329,6 +329,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/prompts.ts` | Prompts, `builtInParts`, the built-in parts a team may override, and `promptParts`, the order of a role's prompt sections |
 | `src/app/context.ts` | The built-in prompt text, read from `prompts/`, and the transcript entries Sessions read |
 | `src/app/skill-files.ts` | Packaged text: `promptFile`, which joins a file's one-sentence lines into paragraphs, and the bundled skills |
+| `src/app/skill-ledger.ts` | Worker skill ledger: `createSkillRecorder` appends one JSON line per `skill` tool call, `readPrivateSkills` loads a worker's own tree, `workerSlotId` names that tree |
 | `src/app/sessions.ts` | Sessions |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |
