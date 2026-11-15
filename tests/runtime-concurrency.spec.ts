@@ -5,6 +5,7 @@ import { Later } from '../src/app/effects.ts'
 import { reportRelay } from '../src/app/notices.ts'
 import { WorkerSlots, inputMessage, mandateInstructions, ticketExecution, transient, triggerMessage } from '../src/executor/dsh.ts'
 import { SettingsSchema } from '../src/policy.ts'
+import { freeSlot, workerSlotName } from '../src/app/skill-ledger.ts'
 import { Commands } from '../src/infra/commands.ts'
 import { deferred, waitUntil } from './fixtures/async.ts'
 import { CHAT, MEMBER, feishu, startRuntime, type Host } from './fixtures/host.ts'
@@ -943,5 +944,43 @@ describe('the Executor\'s parts', () => {
       answers: 'tr9' })!
     expect(ready.id).toMatch(/^report:/)
     expect(JSON.parse(ready.text)).toMatchObject({ kind: 'worker_report', ticket: { ticket_id: 't1' }, trigger_id: 'tr1', state: 'ready', answer_to: 'tr9', summary: 'Done' })
+  })
+})
+
+describe('worker slots', () => {
+  const slotOf = (ticketId: string) => h.runtime.store.tickets.get(ticketId)?.execution?.slot
+  it('names a slot\'s tree as earlier versions did, and gives the lowest slot no other open ticket holds', () => {
+    expect([0, 1, 2].map(workerSlotName)).toEqual(['slot-1', 'slot-2', 'slot-3'])
+    expect(freeSlot([])).toBe(0)
+    expect(freeSlot([0, 2])).toBe(1)
+    expect(freeSlot([1, 0])).toBe(2)
+  })
+  it('gives concurrent tickets their own slots at launch, keeps them across a retry, and gives a stopped ticket\'s slot to the next', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    const two = await h.acceptedTicket(feishu('5', '@bot 修二'))
+    await vi.waitFor(() => expect([slotOf(one.ticket.id), slotOf(two.ticket.id)]).toEqual([0, 1]))
+    // A retry starts a new Assignment in the same slot.
+    h.runtime.engine.deliveryFailed(one.ticket.id, latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)!.id, 'Session busy')
+    h.runtime.engine.retryTicket(one.ticket.id); await h.runtime.idle()
+    await vi.waitFor(() => expect(latestAssignment(h.runtime.store.tickets.get(one.ticket.id)!)).toMatchObject({ state: 'running' }))
+    expect(slotOf(one.ticket.id)).toBe(0)
+    expect(h.runtime.executor.slotFor(one.ticket.id)?.execution?.slot).toBe(0)
+    // Stopping the first frees slot 0, which the next launch takes; the second keeps slot 1.
+    h.runtime.engine.stopTicket(one.ticket.id); await h.runtime.idle()
+    expect(h.runtime.executor.slotFor(one.ticket.id)).toBeUndefined()
+    const three = await h.acceptedTicket(feishu('9', '@bot 修三'))
+    await vi.waitFor(() => expect(slotOf(three.ticket.id)).toBe(0))
+    expect(slotOf(two.ticket.id)).toBe(1)
+  })
+  it('keeps the slot a restart finds on a running ticket, and gives one to a running ticket persisted without it', async () => {
+    const one = await h.acceptedTicket(feishu('1', '@bot 修一'))
+    const two = await h.acceptedTicket(feishu('5', '@bot 修二'))
+    await vi.waitFor(() => expect(slotOf(two.ticket.id)).toBe(1))
+    // An older version left the first ticket running with no slot; the second keeps slot 1 and the first takes slot 0.
+    const stored = h.runtime.store.tickets.get(one.ticket.id)!
+    const { slot: _slot, ...execution } = stored.execution!
+    h.runtime.store.tickets.save({ ...stored, execution })
+    h.runtime.executor.resume(); await h.runtime.idle()
+    expect([slotOf(one.ticket.id), slotOf(two.ticket.id)]).toEqual([0, 1])
   })
 })

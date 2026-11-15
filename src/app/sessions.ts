@@ -17,7 +17,7 @@ import type { Variable } from './execution-environment.ts'
 import { RetryHealth } from './retry-health.ts'
 import { initializeRoleModel } from './role-models.ts'
 import { bundledSkills } from './skill-files.ts'
-import { createSkillRecorder, readPrivateSkills, skillNameOf, workerSkillDir, workerSlotId } from './skill-ledger.ts'
+import { createSkillRecorder, readPrivateSkills, skillNameOf, workerSkillDir, workerSlotName } from './skill-ledger.ts'
 import { SKILL_PREFIX, type PromptVersion, type Prompts } from './prompts.ts'
 import type { Store } from './store.ts'
 import { KV } from '../kv.ts'
@@ -39,13 +39,20 @@ export interface SessionsHost {
   environment(ticket: Ticket): Variable[]
   /** Tools to register on the main Session (`ticket === undefined`) or on `ticket`'s worker Session. */
   tools(agent: Agent, ticket?: Ticket): Tool[]
+  /**
+   * The worker slot of an open ticket, given and persisted on first use (see `DshExecutor.slotFor`); undefined for an
+   * ended or unknown ticket, whose Session then sees no private skill tree.
+   */
+  workerSlot(ticketId: string): number | undefined
 }
 
 /**
  * What Sessions registered for an agent it decorated: the releases of its prompt section, tools and skill scope, the scope
  * its skills are registered in, and the skills of one prompt revision; for a worker's subagent, only its tool limits.
  */
-interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void }; subagent?: true }
+interface SessionBinding { disposers: (() => void)[]; scope?: Context; skills?: { revision: number; dispose: () => void }; subagent?: true
+  /** The private skill tree an Executor Session was bound to, by its slot's name. */
+  worker?: string }
 
 /** The agent presets Executor Sessions and the main Session are created with, which the bundle's patch defines. */
 export const WORKER_PRESET = 'dsh-superagent-worker', ROUTER_PRESET = 'dsh-superagent-router'
@@ -241,14 +248,19 @@ export class Sessions {
     return ticketId === undefined ? undefined : this.host.store.tickets.get(ticketId)
   }
   private async decorate(agent: Agent): Promise<void> {
-    if (this.bindings.has(agent)) return
     const host = this.host
     const master = agent.id === host.masterId
     const ticket = master ? undefined : this.ticketOf(agent)
+    // The worker's own skill tree, named by the slot the Executor gave its ticket: it alone sees these drafts, and every
+    // load it makes is counted for promotion under that slot.
+    const slot = ticket ? host.workerSlot(ticket.id) : undefined
+    const worker = slot === undefined ? undefined : workerSlotName(slot)
+    const bound = this.bindings.get(agent)
+    // A ticket that ended and resumed into another slot rebinds its Session to that slot's tree.
+    if (bound && (bound.subagent || master || !worker || bound.worker === worker)) return
+    if (bound) this.release(agent)
     if (!master && !ticket) { this.limitSubagent(agent); return }
-    // The worker's own skill tree: it alone sees these drafts, and every load it makes is counted for promotion.
-    const worker = ticket ? workerSlotId(ticket.id, host.store.settings().executor.maxWorkers ?? 2) : undefined
-    const binding: SessionBinding = { disposers: [] }
+    const binding: SessionBinding = { disposers: [], ...worker ? { worker } : {} }
     this.bindings.set(agent, binding)
     this.retryHealth.restore(agent.id, agent.session.snapshotEvents())
     if (agent.status === 'idle') this.retryHealth.clear(agent.id)

@@ -312,7 +312,16 @@ export interface Ticket {
  * Thread closed; the ticket then ends unless its work has not finished (see `Tickets.unfinished`).
  */
 export interface Follow { thread: string; own: boolean; closed?: { at: string; outcome: 'merged' | 'closed' } }
-export interface Execution { name: string; directory: string; assignment: string }
+export interface Execution {
+  name: string
+  directory: string
+  assignment: string
+  /**
+   * The worker slot its Executor was given at its first launch, from 0: it names the worker's private skill tree and keeps it
+   * across wakes, retries and restarts; the ticket holds it while it is open, and its end frees it for the next launch.
+   */
+  slot?: number
+}
 
 /** Whether a ticket is open: it has not ended. */
 export const liveTicket = (ticket: Pick<Ticket, 'ended'>): boolean => !ticket.ended

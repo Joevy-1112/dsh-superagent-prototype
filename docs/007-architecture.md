@@ -200,7 +200,7 @@ That context supplies deployment and commands, setup readiness (`ready`, `config
 
 `prepare(ticket, outcome)` supplies the Engine's `prepareTicket` hook: short name, directory and `ticketExecution` assignment text. `workerSessionId(ticket.id)` derives the Session id.
 
-`WorkerSlots` reserves capacity before a launch or a delivery that wakes an idle worker. A human message can use one slot beyond `maxWorkers`, and wakes have priority over launches. `activeCount` supplies panel load.
+`WorkerSlots` reserves capacity before a launch or a delivery that wakes an idle worker. A human message can use one slot beyond `maxWorkers`, and wakes have priority over launches. `activeCount` supplies panel load. `slotFor` gives a ticket its worker slot, the lowest one no other open ticket holds, when its first launch or wake reserves capacity, and persists it as `execution.slot`; wakes, retries and restarts keep it, and the ticket's end frees it because only open tickets hold slots. The slot names the worker's private skill tree and the `worker` field of the skill ledger.
 
 Transient provider and network failures get three retries. Launches use effect backoff; failed turns receive continuation messages after 15, 30 and 60 seconds. `inputMessage` renders each Input from current Ticket state, and `mandateInstructions` adds the matched-rule limits for inferred work.
 
@@ -329,7 +329,7 @@ Some generic modules still refer directly to GitHub or Feishu:
 | `src/app/prompts.ts` | Prompts, `builtInParts`, the built-in parts a team may override, and `promptParts`, the order of a role's prompt sections |
 | `src/app/context.ts` | The built-in prompt text, read from `prompts/`, and the transcript entries Sessions read |
 | `src/app/skill-files.ts` | Packaged text: `promptFile`, which joins a file's one-sentence lines into paragraphs, and the bundled skills |
-| `src/app/skill-ledger.ts` | Worker skill ledger: `createSkillRecorder` appends one JSON line per `skill` tool call, `readPrivateSkills` loads a worker's own tree, `workerSlotId` names that tree |
+| `src/app/skill-ledger.ts` | Worker skill ledger: `createSkillRecorder` appends one JSON line per `skill` tool call, `readPrivateSkills` loads a worker's own tree, `workerSlotName` names that tree after the ticket's persisted `execution.slot` (slot 0 is `slot-1`), `freeSlot` picks the lowest slot no other open ticket holds |
 | `src/app/sessions.ts` | Sessions |
 | `src/app/delivery.ts` | `AgentDelivery`: delivers a message to a DeepSeek Harness agent once per request id, also across a restored Session |
 | `src/app/retry-health.ts` | `RetryHealth`: which Sessions wait on a model budget retry, for the `models` health entry |

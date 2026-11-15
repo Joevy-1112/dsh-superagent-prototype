@@ -64,11 +64,25 @@ export function skillNameOf(input: unknown): string | undefined {
   return undefined
 }
 
-/** A worker's stable identity: one bucket per executor slot, so drafts outlive the ticket that wrote them. */
-export function workerSlotId(ticketId: string, slots: number): string {
-  let hash = 0
-  for (const char of ticketId) hash = (hash * 31 + char.charCodeAt(0)) >>> 0
-  return `slot-${(hash % Math.max(1, Math.trunc(slots))) + 1}`
+/**
+ * The name of a worker slot's private skill tree: slot 0 is `slot-1`, so the trees of the slots stay where earlier versions
+ * wrote them and the promoter attributes their drafts and loads to the same worker.
+ */
+export function workerSlotName(slot: number): string {
+  return `slot-${Math.trunc(slot) + 1}`
+}
+
+/**
+ * The lowest slot no other open ticket holds. While at most `maxWorkers` tickets are open that is one of 0..maxWorkers-1;
+ * tickets that wait on a person stay open and keep theirs, so with more open tickets the next number is given rather than
+ * a slot another open ticket holds, and two open tickets never share a private tree.
+ * @param held - The slots the other open tickets hold.
+ */
+export function freeSlot(held: Iterable<number>): number {
+  const taken = new Set(held)
+  let slot = 0
+  while (taken.has(slot)) slot++
+  return slot
 }
 
 /** One skill found in a private tree. */

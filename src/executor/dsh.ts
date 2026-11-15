@@ -16,6 +16,7 @@ import { executionRoot, type Variable } from '../app/execution-environment.ts'
 import type { Sessions } from '../app/sessions.ts'
 import { worktreeSegment } from '../app/assessment.ts'
 import { resultRelay } from '../app/notices.ts'
+import { freeSlot } from '../app/skill-ledger.ts'
 import type { HealthEntry } from '../infra/health.ts'
 import { cancelled, collectJob, killJobs, runningJobs, stopBackground, stopSubagents, until, untilQuiet } from './background.ts'
 
@@ -276,7 +277,7 @@ export class DshExecutor implements Executor {
     const assignment = ticket && latestAssignment(ticket)
     if (!ticket || !liveTicket(ticket) || assignment?.id !== assignmentId || assignment.state !== 'pending') return
     this.slots.reserve(ticketId, 'launch')
-    try { await this.launch(ticket, assignment); this.transient.delete(`launch:${assignmentId}`) }
+    try { await this.launch(this.slotFor(ticketId) ?? ticket, assignment); this.transient.delete(`launch:${assignmentId}`) }
     catch (error) {
       // Shutdown or pause re-queues the launch for resume, and transient network/provider errors retry with backoff.
       // A failed prepare command is not retried automatically because an existing directory counts as prepared, so retrying
@@ -311,6 +312,7 @@ export class DshExecutor implements Executor {
           const person = ticket.undelivered.some(id => fromPerson(ticket.inputs.find(item => item.id === id)))
           this.slots.reserve(ticketId, person ? 'person' : 'wake')
           woken = true
+          this.slotFor(ticketId)
         }
         const input = ticket.inputs.find(item => item.id === inputId)
         try {
@@ -403,6 +405,25 @@ export class DshExecutor implements Executor {
       await Promise.allSettled(running.map(agent => agent.whenIdle()))
     }
     await until(stop(), undefined, SHUTDOWN_STOP_MS)
+  }
+  /**
+   * Gives an open ticket its worker slot and persists it as `execution.slot`, or keeps the one it has: the lowest slot no
+   * other open ticket holds (see `freeSlot`). A ticket keeps its slot across wakes, retries and restarts; ending frees it,
+   * since only open tickets hold slots, and a ticket resumed after another took its slot gets a free one. Runs synchronously
+   * right after a slot reservation, so two starts cannot pick the same slot.
+   * @returns The stored ticket, or undefined when it is unknown, ended or has no execution.
+   */
+  slotFor(ticketId: string): Ticket | undefined {
+    return this.host.store.atomic(() => {
+      const ticket = this.host.store.tickets.get(ticketId)
+      if (!ticket || !liveTicket(ticket) || !ticket.execution) return undefined
+      const held = this.host.store.tickets.open().flatMap(other => other.id !== ticketId && other.execution?.slot !== undefined ? [other.execution.slot] : [])
+      const slot = ticket.execution.slot
+      if (slot !== undefined && !held.includes(slot)) return ticket
+      const assigned = { ...ticket, execution: { ...ticket.execution, slot: freeSlot(held) } }
+      this.host.store.tickets.save(assigned)
+      return assigned
+    })
   }
   /** Number of open tickets whose worker holds a worker slot: its turn runs, or its shell jobs or subagents still run after its turn ended. */
   activeCount(): number { return this.host.store.tickets.open().filter(ticket => this.running(ticket)).length }
@@ -528,6 +549,8 @@ export class DshExecutor implements Executor {
   resume(): void {
     // Launch pending tickets oldest first (in acceptance order).
     for (const ticket of this.host.store.tickets.open().sort((a, b) => a.createdAt.localeCompare(b.createdAt))) {
+      // A ticket whose worker ran before slots were persisted gets one now, so its worker keeps the same tree from here on.
+      if (runningAssignment(ticket)) this.slotFor(ticket.id)
       const running = runningAssignment(ticket), latest = latestAssignment(ticket)
       if (running) {
         // A restart within this process left DSH's Sessions, jobs and subagents running: they stop first. The inbox keeps an
